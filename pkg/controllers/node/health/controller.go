@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -55,20 +56,26 @@ var allowedUnhealthyPercent = intstr.FromString("20%")
 
 // Controller for the resource
 type Controller struct {
-	clock         clock.Clock
-	recorder      events.Recorder
-	kubeClient    client.Client
-	cloudProvider cloudprovider.CloudProvider
+	clock               clock.Clock
+	recorder            events.Recorder
+	kubeClient          client.Client
+	cloudProvider       cloudprovider.CloudProvider
+	repairPolicyMatcher *RepairPolicyMatcher
 }
 
-// NewController constructs a controller instance
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, clock clock.Clock, recorder events.Recorder) *Controller {
-	return &Controller{
-		clock:         clock,
-		recorder:      recorder,
-		kubeClient:    kubeClient,
-		cloudProvider: cloudProvider,
+// NewController validates the cloud provider's repair policies and constructs a controller instance.
+func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, clock clock.Clock, recorder events.Recorder) (*Controller, error) {
+	repairPolicyMatcher, err := NewRepairPolicyMatcher(cloudProvider.RepairPolicies(), sets.New(cloudprovider.ReplaceNode))
+	if err != nil {
+		return nil, err
 	}
+	return &Controller{
+		clock:               clock,
+		recorder:            recorder,
+		kubeClient:          kubeClient,
+		cloudProvider:       cloudProvider,
+		repairPolicyMatcher: repairPolicyMatcher,
+	}, nil
 }
 
 func (c *Controller) Name() string {
@@ -78,34 +85,33 @@ func (c *Controller) Name() string {
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&corev1.Node{}, builder.WithPredicates(nodeutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				oldNode := e.ObjectOld.(*corev1.Node)
-				newNode := e.ObjectNew.(*corev1.Node)
-				if len(oldNode.Status.Conditions) != len(newNode.Status.Conditions) {
-					return true
-				}
-
-				for _, oldCond := range oldNode.Status.Conditions {
-					newCond := nodeutils.GetCondition(newNode, oldCond.Type)
-					// Return true if any of these conditions are met:
-					// 1. Condition type no longer exists in new node
-					// 2. Transition time has changed
-					// 3. Status has changed
-					if newCond.Type == "" ||
-						oldCond.LastTransitionTime != newCond.LastTransitionTime ||
-						oldCond.Status != newCond.Status {
-						return true
-					}
-				}
-				return false
-			},
-		})).
+		For(&corev1.Node{}, builder.WithPredicates(nodeutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{UpdateFunc: c.nodeHealthChanged})).
 		WithOptions(controller.Options{
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000),
 		}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
+}
+
+func (c *Controller) nodeHealthChanged(e event.UpdateEvent) bool {
+	oldNode := e.ObjectOld.(*corev1.Node)
+	newNode := e.ObjectNew.(*corev1.Node)
+	if len(oldNode.Status.Conditions) != len(newNode.Status.Conditions) {
+		return true
+	}
+
+	for _, oldCondition := range oldNode.Status.Conditions {
+		newCondition := nodeutils.GetCondition(newNode, oldCondition.Type)
+		if newCondition.Type == "" ||
+			oldCondition.LastTransitionTime != newCondition.LastTransitionTime ||
+			oldCondition.Status != newCondition.Status {
+			return true
+		}
+		if oldCondition.Reason != newCondition.Reason && c.repairPolicyMatcher.hasReasonPolicies(oldCondition) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcile.Result, error) {
@@ -116,19 +122,24 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	if err != nil {
 		return reconcile.Result{}, nodeutils.IgnoreDuplicateNodeClaimError(nodeutils.IgnoreNodeClaimNotFoundError(err))
 	}
-	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)))
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues(
+		"Node", klog.KObj(node),
+		"NodeClaim", klog.KObj(nodeClaim),
+	))
 
-	unhealthyNodeCondition, policyTerminationDuration := c.findUnhealthyConditions(node)
-	if unhealthyNodeCondition == nil {
+	now := c.clock.Now()
+	decision, ok := c.selectRepairDecision(node, now)
+	if !ok {
 		return reconcile.Result{}, nil
 	}
+	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues(decision.logValues()...))
 
-	// If the Node is unhealthy, but has not reached its full toleration disruption
-	// requeue at the termination time of the unhealthy node
-	terminationTime := unhealthyNodeCondition.LastTransitionTime.Add(policyTerminationDuration)
-	if c.clock.Now().Before(terminationTime) {
-		return reconcile.Result{RequeueAfter: terminationTime.Sub(c.clock.Now())}, nil
+	// If no matching policy is eligible, requeue when the next policy becomes eligible.
+	if !decision.eligible {
+		log.FromContext(ctx).V(1).Info("waiting for repair policy eligibility")
+		return reconcile.Result{RequeueAfter: decision.eligibleAt.Sub(now)}, nil
 	}
+	log.FromContext(ctx).V(1).Info("repair policy eligible")
 
 	// If a nodeclaim does have a nodepool label, validate the nodeclaims inside the nodepool are healthy (i.e bellow the allowed threshold)
 	// In the case of standalone nodeclaim, validate the nodes inside the cluster are healthy before proceeding
@@ -155,22 +166,22 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 			return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
 		}
 	}
-	// For unhealthy past the tolerationDisruption window we can forcefully terminate the node
+	// This controller currently supports only ReplaceNode and executes it through forceful NodeClaim deletion.
 	if err := c.annotateTerminationGracePeriod(ctx, nodeClaim); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	return c.deleteNodeClaim(ctx, nodeClaim, node, unhealthyNodeCondition)
+	return c.deleteNodeClaim(ctx, nodeClaim, node, decision)
 }
 
 // deleteNodeClaim removes the NodeClaim from the api-server
-func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, unhealthyNodeCondition *corev1.NodeCondition) (reconcile.Result, error) {
+func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim, node *corev1.Node, decision repairDecision) (reconcile.Result, error) {
 	if !nodeClaim.DeletionTimestamp.IsZero() {
 		return reconcile.Result{}, nil
 	}
 	if err := c.kubeClient.Delete(ctx, nodeClaim); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	// The deletion timestamp has successfully been set for the Node, update relevant metrics.
+	// The deletion timestamp has successfully been set for the NodeClaim, update relevant metrics.
 	log.FromContext(ctx).Info("deleting unhealthy node")
 	labels := map[string]string{
 		metrics.ReasonLabel:              metrics.UnhealthyReason,
@@ -188,7 +199,7 @@ func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *v1.NodeClai
 	}
 	metrics.PodsDisruptionInitiatedTotal.Add(float64(len(reschedulablePods)), labels)
 	NodeClaimsUnhealthyDisruptedTotal.Inc(map[string]string{
-		ConditionLabel:            pretty.ToSnakeCase(string(unhealthyNodeCondition.Type)),
+		ConditionLabel:            pretty.ToSnakeCase(string(decision.condition.Type)),
 		metrics.NodePoolLabel:     node.Labels[v1.NodePoolLabelKey],
 		metrics.CapacityTypeLabel: node.Labels[v1.CapacityTypeLabelKey],
 		ImageIDLabel:              nodeClaim.Status.ImageID,
@@ -196,24 +207,23 @@ func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *v1.NodeClai
 	return reconcile.Result{}, nil
 }
 
-// Find a node with a condition that matches one of the unhealthy conditions defined by the cloud provider
-// If there are multiple unhealthy status condition we will requeue based on the condition closest to its terminationDuration
-func (c *Controller) findUnhealthyConditions(node *corev1.Node) (nc *corev1.NodeCondition, cpTerminationDuration time.Duration) {
-	requeueTime := time.Time{}
-	for _, policy := range c.cloudProvider.RepairPolicies() {
-		// check the status and the type on the condition
-		nodeCondition := nodeutils.GetCondition(node, policy.ConditionType)
-		if nodeCondition.Status == policy.ConditionStatus {
-			terminationTime := nodeCondition.LastTransitionTime.Add(policy.TolerationDuration)
-			// Determine requeue time
-			if requeueTime.IsZero() || requeueTime.After(terminationTime) {
-				nc = new(nodeCondition)
-				cpTerminationDuration = policy.TolerationDuration
-				requeueTime = terminationTime
-			}
+// selectRepairDecision prefers eligible decisions, then selects the decision with the earliest eligibility time.
+func (c *Controller) selectRepairDecision(node *corev1.Node, now time.Time) (repairDecision, bool) {
+	var selected repairDecision
+	selectedSet := false
+	for _, condition := range node.Status.Conditions {
+		decision, ok := c.repairPolicyMatcher.evaluateDecision(condition, now)
+		if !ok {
+			continue
+		}
+		if !selectedSet ||
+			(decision.eligible && !selected.eligible) ||
+			(decision.eligible == selected.eligible && decision.eligibleAt.Before(selected.eligibleAt)) {
+			selected = decision
+			selectedSet = true
 		}
 	}
-	return nc, cpTerminationDuration
+	return selected, selectedSet
 }
 
 func (c *Controller) annotateTerminationGracePeriod(ctx context.Context, nodeClaim *v1.NodeClaim) error {
@@ -255,11 +265,9 @@ func (c *Controller) areNodesHealthy(ctx context.Context, opts ...client.ListOpt
 		return false, err
 	}
 	unhealthyNodeCount := lo.CountBy(nodeList.Items, func(node corev1.Node) bool {
-		_, found := lo.Find(c.cloudProvider.RepairPolicies(), func(policy cloudprovider.RepairPolicy) bool {
-			nodeCondition := nodeutils.GetCondition(new(node), policy.ConditionType)
-			return nodeCondition.Status == policy.ConditionStatus
+		return lo.SomeBy(node.Status.Conditions, func(condition corev1.NodeCondition) bool {
+			return c.repairPolicyMatcher.hasCondition(condition)
 		})
-		return found
 	})
 	threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(new(allowedUnhealthyPercent), len(nodeList.Items), true))
 	return unhealthyNodeCount <= threshold, nil

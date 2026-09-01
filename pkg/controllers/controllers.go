@@ -27,6 +27,7 @@ import (
 	"github.com/samber/lo"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
@@ -93,6 +94,22 @@ func WithRegistrationHook(hook cloudprovider.NodeLifecycleHook) option.Function[
 	return func(o *ControllerOptions) {
 		o.registrationHooks = append(o.registrationHooks, hook)
 	}
+}
+
+func appendNodeHealthController(
+	ctx context.Context,
+	controllers []controller.Controller,
+	kubeClient client.Client,
+	cloudProvider cloudprovider.CloudProvider,
+	clock clock.Clock,
+	recorder events.Recorder,
+) []controller.Controller {
+	healthController, err := health.NewController(kubeClient, cloudProvider, clock, recorder)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "disabling node repair due to invalid repair policies")
+		return controllers
+	}
+	return append(controllers, healthController)
 }
 
 func NewControllers(
@@ -174,9 +191,8 @@ func NewControllers(
 		)
 	}
 
-	// The cloud provider must define status conditions for the node repair controller to use to detect unhealthy nodes
 	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair {
-		controllers = append(controllers, health.NewController(kubeClient, cloudProvider, clock, recorder))
+		controllers = appendNodeHealthController(ctx, controllers, kubeClient, cloudProvider, clock, recorder)
 	}
 
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {
