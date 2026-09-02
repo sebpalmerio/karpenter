@@ -64,7 +64,6 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Client, recorder)
-	healthController = health.NewController(env.Client, cloudProvider, env.Clock, recorder)
 })
 
 var _ = AfterSuite(func() {
@@ -79,6 +78,7 @@ var _ = Describe("Node Health", func() {
 	BeforeEach(func() {
 		env.Clock.SetTime(time.Now())
 		cloudProvider.Reset()
+		healthController = lo.Must(health.NewController(env.Client, cloudProvider, env.Clock, recorder))
 
 		nodePool = test.NodePool()
 		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Finalizers: []string{v1.TerminationFinalizer}}})
@@ -152,6 +152,67 @@ var _ = Describe("Node Health", func() {
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 		})
+		It("should suppress the fallback while a reason-specific policy is waiting", func() {
+			cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+				{
+					ConditionType:      "BadNode",
+					ConditionStatus:    corev1.ConditionFalse,
+					ReasonRegex:        "^KnownFailure$",
+					TolerationDuration: 60 * time.Minute,
+					Action:             cloudprovider.ReplaceNode,
+				},
+				{
+					ConditionType:      "BadNode",
+					ConditionStatus:    corev1.ConditionFalse,
+					TolerationDuration: 0,
+					Action:             cloudprovider.ReplaceNode,
+				},
+			}
+			healthController = lo.Must(health.NewController(env.Client, cloudProvider, env.Clock, recorder))
+			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+				Type:               "BadNode",
+				Status:             corev1.ConditionFalse,
+				Reason:             "KnownFailure",
+				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
+			})
+			env.Clock.Step(30 * time.Minute)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+
+			result := ExpectObjectReconciled(ctx, env.Client, healthController, node)
+			Expect(result.RequeueAfter).To(BeNumerically("~", 30*time.Minute, time.Second))
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
+		})
+		It("should use the fallback for an unknown reason", func() {
+			cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+				{
+					ConditionType:      "BadNode",
+					ConditionStatus:    corev1.ConditionFalse,
+					ReasonRegex:        "^KnownFailure$",
+					TolerationDuration: 60 * time.Minute,
+					Action:             cloudprovider.ReplaceNode,
+				},
+				{
+					ConditionType:      "BadNode",
+					ConditionStatus:    corev1.ConditionFalse,
+					TolerationDuration: 10 * time.Minute,
+					Action:             cloudprovider.ReplaceNode,
+				},
+			}
+			healthController = lo.Must(health.NewController(env.Client, cloudProvider, env.Clock, recorder))
+			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+				Type:               "BadNode",
+				Status:             corev1.ConditionFalse,
+				Reason:             "NewFailure",
+				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
+			})
+			env.Clock.Step(15 * time.Minute)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+
+			ExpectObjectReconciled(ctx, env.Client, healthController, node)
+			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nodeClaim.DeletionTimestamp).ToNot(BeNil())
+		})
 		It("should set annotation termination grace period when force termination is started", func() {
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:   "BadNode",
@@ -206,13 +267,16 @@ var _ = Describe("Node Health", func() {
 					ConditionType:      "BadNode",
 					ConditionStatus:    corev1.ConditionFalse,
 					TolerationDuration: 60 * time.Minute,
+					Action:             cloudprovider.ReplaceNode,
 				},
 				{
 					ConditionType:      "ValidUnhealthyCondition",
 					ConditionStatus:    corev1.ConditionFalse,
 					TolerationDuration: 30 * time.Minute,
+					Action:             cloudprovider.ReplaceNode,
 				},
 			}
+			healthController = lo.Must(health.NewController(env.Client, cloudProvider, env.Clock, recorder))
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:   "ValidUnhealthyCondition",
 				Status: corev1.ConditionFalse,
