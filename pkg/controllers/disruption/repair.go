@@ -81,21 +81,8 @@ func NewRepair(c consolidation) *Repair {
 	}
 }
 
-// ShouldConsider cheaply rejects healthy or not-yet-eligible nodes before disruption candidate construction.
-func (r *Repair) ShouldConsider(ctx context.Context, node *state.StateNode) bool {
-	if !options.FromContext(ctx).FeatureGates.NodeRepair ||
-		node.Node == nil ||
-		node.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
-		return false
-	}
-	now := r.clock.Now()
-	evaluation := r.policyMatcher.Evaluate(node.Node, now)
-	r.logRepairPolicyDecisions(ctx, node.Node, evaluation.Evaluations)
-	return evaluation.Decision != nil
-}
-
-// ShouldDisrupt filters candidates to eligible unhealthy nodes and stores the resolved repair decision for command
-// computation. Revalidation recomputes the decision from current state before replacement commitment.
+// ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
+// RepairPolicy, have waited past that policy's toleration, and are not vetoed by the do-not-repair annotation.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
 	if !options.FromContext(ctx).FeatureGates.NodeRepair {
@@ -167,9 +154,6 @@ func (r *Repair) commandForCandidate(
 	if !ok {
 		return Command{}, false, nil
 	}
-	// Set the candidate's drain bound; after any required replacements are ready, the queue stamps the absolute deadline
-	// immediately before requesting deletion. A forceful (0) policy skips the drain for conditions the kubelet can't
-	// evict through, without replacement-launch latency eroding the window.
 	log.FromContext(ctx).WithValues(append([]any{
 		"Node", klog.KObj(candidate.Node),
 		"NodeClaim", klog.KObj(candidate.NodeClaim),
