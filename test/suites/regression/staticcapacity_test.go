@@ -17,6 +17,7 @@ limitations under the License.
 package integration_test
 
 import (
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,9 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/test/pkg/environment/common"
 )
 
 var _ = Describe("StaticCapacity", func() {
@@ -250,7 +255,6 @@ var _ = Describe("StaticCapacity", func() {
 
 	Context("Drift", func() {
 		BeforeEach(func() {
-			nodePool.Spec.Replicas = new(int64(10))
 			if env.IsDefaultNodeClassKWOK() {
 				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
 					Key:      corev1.LabelInstanceTypeStable,
@@ -261,10 +265,12 @@ var _ = Describe("StaticCapacity", func() {
 					},
 				})
 			}
-			env.ExpectCreated(nodeClass, nodePool)
 		})
 
 		It("should replace drifted nodes", func() {
+			nodePool.Spec.Replicas = new(int64(10))
+			env.ExpectCreated(nodeClass, nodePool)
+
 			// Initially should have 10 nodes
 			env.EventuallyExpectInitializedNodeCount("==", 10)
 			nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 10)
@@ -282,6 +288,9 @@ var _ = Describe("StaticCapacity", func() {
 		})
 
 		It("should handle drift with node limits when budget allows", func() {
+			nodePool.Spec.Replicas = new(int64(10))
+			env.ExpectCreated(nodeClass, nodePool)
+
 			// Initially should have 10 nodes
 			env.EventuallyExpectInitializedNodeCount("==", 10)
 			nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 10)
@@ -305,6 +314,9 @@ var _ = Describe("StaticCapacity", func() {
 		})
 
 		It("should handle drift with node limits when budget restricts", func() {
+			nodePool.Spec.Replicas = new(int64(10))
+			env.ExpectCreated(nodeClass, nodePool)
+
 			// Initially should have 10 nodes
 			env.EventuallyExpectInitializedNodeCount("==", 10)
 			nodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 10)
@@ -325,6 +337,93 @@ var _ = Describe("StaticCapacity", func() {
 
 			// Should create a replacement node and then remove the drifted one 2 at a time
 			env.ConsistentlyExpectDisruptionsUntilNoneLeft(10, 2, 5*time.Minute)
+		})
+
+		It("should replace an at-limit static NodePool without exceeding its node limit", func() {
+			const nodeCount = 3
+			const driftAnnotation = "testing.karpenter.sh/terminate-first-drift"
+			if !terminateFirstDriftEnabled() {
+				if env.IsDefaultNodeClassKWOK() {
+					Fail("core KWOK regression setup must enable the TerminateFirstDrift feature gate")
+				}
+				Skip("terminate-first drift regression coverage requires the TerminateFirstDrift feature gate")
+			}
+
+			nodePool.Spec.Replicas = lo.ToPtr[int64](nodeCount)
+			nodePool.Spec.Limits = v1.Limits{corev1.ResourceName("nodes"): resource.MustParse("3")}
+			nodePool.Spec.Template.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Minute}
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1", Reasons: []v1.DisruptionReason{v1.DisruptionReasonDrifted}}}
+			deployment := test.Deployment(test.DeploymentOptions{
+				Replicas: nodeCount,
+				PodOptions: test.PodOptions{
+					ObjectMeta:          metav1.ObjectMeta{Labels: map[string]string{"app": "terminate-first-drift"}},
+					PodAntiRequirements: hostnameAntiAffinity(map[string]string{"app": "terminate-first-drift"}),
+				},
+			})
+			selector := labels.SelectorFromSet(deployment.Spec.Selector.MatchLabels)
+			env.ExpectCreated(nodeClass, nodePool, deployment)
+			env.EventuallyExpectHealthyPodCount(selector, nodeCount)
+			env.EventuallyExpectNodeCount("==", nodeCount)
+			originalNodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", nodeCount)
+			originalUIDs := lo.SliceToMap(originalNodeClaims, func(nodeClaim *v1.NodeClaim) (types.UID, struct{}) {
+				return nodeClaim.UID, struct{}{}
+			})
+			for _, nodeClaim := range originalNodeClaims {
+				Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
+				nodeClaim.Finalizers = append(nodeClaim.Finalizers, common.TestingFinalizer)
+				env.ExpectUpdated(nodeClaim)
+			}
+
+			nodePool.Spec.Template.Annotations = lo.Assign(nodePool.Spec.Template.Annotations, map[string]string{driftAnnotation: "true"})
+			env.ExpectUpdated(nodePool)
+			env.EventuallyExpectDrifted(originalNodeClaims...)
+
+			var activeTarget *v1.NodeClaim
+			Eventually(func(g Gomega) {
+				nodeClaims := &v1.NodeClaimList{}
+				g.Expect(env.Client.List(env, nodeClaims, client.MatchingLabels{v1.NodePoolLabelKey: nodePool.Name})).To(Succeed())
+				g.Expect(nodeClaims.Items).To(HaveLen(nodeCount))
+				g.Expect(lo.EveryBy(nodeClaims.Items, func(nodeClaim v1.NodeClaim) bool {
+					_, original := originalUIDs[nodeClaim.UID]
+					return original
+				})).To(BeTrue())
+				deleting := lo.Filter(nodeClaims.Items, func(nodeClaim v1.NodeClaim, _ int) bool {
+					return !nodeClaim.DeletionTimestamp.IsZero()
+				})
+				g.Expect(deleting).To(HaveLen(1))
+				activeTarget = deleting[0].DeepCopy()
+			}).Should(Succeed())
+
+			for _, nodeClaim := range originalNodeClaims {
+				Expect(env.ExpectTestingFinalizerRemoved(nodeClaim)).To(Succeed())
+			}
+			env.EventuallyExpectNotFound(activeTarget)
+
+			Eventually(func(g Gomega) bool {
+				nodeClaims := &v1.NodeClaimList{}
+				g.Expect(env.Client.List(env, nodeClaims, client.MatchingLabels{v1.NodePoolLabelKey: nodePool.Name})).To(Succeed())
+				nonTerminating := lo.Reject(nodeClaims.Items, func(nodeClaim v1.NodeClaim, _ int) bool {
+					return !nodeClaim.DeletionTimestamp.IsZero() ||
+						nodeClaim.StatusConditions().IsTrue(v1.ConditionTypeInstanceTerminating)
+				})
+				if len(nonTerminating) > nodeCount {
+					StopTrying(fmt.Sprintf("static drift exceeded node limit: %d non-terminating NodeClaims", len(nonTerminating))).Now()
+				}
+				if len(nodeClaims.Items) != nodeCount || len(nonTerminating) != nodeCount {
+					return false
+				}
+				for i := range nodeClaims.Items {
+					if _, original := originalUIDs[nodeClaims.Items[i].UID]; original ||
+						!nodeClaims.Items[i].StatusConditions().Root().IsTrue() ||
+						nodeClaims.Items[i].Annotations[driftAnnotation] != "true" {
+						return false
+					}
+				}
+				return true
+			}).Should(BeTrue())
+
+			env.EventuallyExpectNodeCount("==", nodeCount)
+			env.EventuallyExpectHealthyPodCount(selector, nodeCount)
 		})
 	})
 
@@ -496,3 +595,15 @@ var _ = Describe("StaticCapacity", func() {
 		})
 	})
 })
+
+func terminateFirstDriftEnabled() bool {
+	featureGates, found := lo.Find(env.ExpectSettings(), func(setting corev1.EnvVar) bool {
+		return setting.Name == "FEATURE_GATES"
+	})
+	if !found {
+		return false
+	}
+	gates, err := options.ParseFeatureGates(featureGates.Value)
+	Expect(err).ToNot(HaveOccurred())
+	return gates.TerminateFirstDrift
+}

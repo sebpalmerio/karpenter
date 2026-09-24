@@ -60,6 +60,8 @@ type FeatureGates struct {
 	NodeOverlay             *bool
 	StaticCapacity          *bool
 	CapacityBuffer          *bool
+	TerminateFirstDrift     *bool
+	TerminateFirstRepair    *bool
 }
 
 func Options(overrides ...OptionsFields) *options.Options {
@@ -98,6 +100,8 @@ func Options(overrides ...OptionsFields) *options.Options {
 			NodeOverlay:             lo.FromPtrOr(opts.FeatureGates.NodeOverlay, false),
 			StaticCapacity:          lo.FromPtrOr(opts.FeatureGates.StaticCapacity, false),
 			CapacityBuffer:          lo.FromPtrOr(opts.FeatureGates.CapacityBuffer, false),
+			TerminateFirstDrift:     lo.FromPtrOr(opts.FeatureGates.TerminateFirstDrift, false),
+			TerminateFirstRepair:    lo.FromPtrOr(opts.FeatureGates.TerminateFirstRepair, false),
 		},
 	}
 }

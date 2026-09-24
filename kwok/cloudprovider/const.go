@@ -16,8 +16,15 @@ limitations under the License.
 
 package kwok
 
+import corev1 "k8s.io/api/core/v1"
+
 const (
 	kwokProviderPrefix = "kwok://"
+
+	// KWOKUnhealthyCondition is a durable condition used to simulate an unhealthy node in repair e2e tests.
+	KWOKUnhealthyCondition corev1.NodeConditionType = "KWOKUnhealthy"
+	// KWOKUnhealthyReason selects the short repair policy used by repair e2e tests.
+	KWOKUnhealthyReason = "E2ERepair"
 )
 
 var kwokPartitions = []string{"a"}
