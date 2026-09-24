@@ -18,134 +18,120 @@ package disruption
 
 import (
 	"sync"
-	"testing"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	clocktesting "k8s.io/utils/clock/testing"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
-func TestRebootHistoryEscalatesAfterTwoCommittedReboots(t *testing.T) {
-	history := NewRebootHistory()
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	oneMinute := time.Minute
-	results := []RepairResult{
-		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), &oneMinute),
-	}
-
-	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
-		t.Fatalf("expected the first repair to remain a reboot: %#v", candidate)
-	}
-
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
-		t.Fatalf("expected the second repair to remain a reboot: %#v", candidate)
-	}
-	if candidate.RebootEscalated {
-		t.Fatal("expected one committed reboot not to trigger escalation")
-	}
-
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.ReplaceNode {
-		t.Fatalf("expected two committed reboots to escalate to replacement: %#v", candidate)
-	}
-	if !candidate.RebootEscalated {
-		t.Fatal("expected escalation to be recorded")
-	}
-	if results[0].Action != cloudprovider.RebootNode {
-		t.Fatal("expected history resolution to leave matching results unchanged")
-	}
-}
-
-func TestRebootHistoryResolveDoesNotRecordReboots(t *testing.T) {
-	history := NewRebootHistory()
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	results := []RepairResult{
-		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
-	}
-
-	for range 3 {
-		if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
-			t.Fatalf("expected uncommitted resolution not to consume a reboot: %#v", candidate)
+var _ = Describe("RebootHistory", func() {
+	It("escalates after two committed reboots", func() {
+		history := NewRebootHistory()
+		candidate := repairCandidateForTest("nodeclaim-uid")
+		oneMinute := time.Minute
+		results := []RepairResult{
+			repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), &oneMinute),
 		}
-	}
-}
 
-func TestRebootHistoryUsesNodeClaimUID(t *testing.T) {
-	history := NewRebootHistory()
-	results := []RepairResult{
-		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
-	}
-	original := repairCandidateForTest("original-uid")
-	history.RecordCommittedReboot(original.NodeClaim.UID)
-	history.RecordCommittedReboot(original.NodeClaim.UID)
+		Expect(history.Resolve(candidate, results)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
 
-	successor := repairCandidateForTest("successor-uid")
-	if !history.Resolve(successor, results) || successor.Action != cloudprovider.RebootNode {
-		t.Fatalf("expected a successor NodeClaim to have independent history: %#v", successor)
-	}
-}
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		Expect(history.Resolve(candidate, results)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
+		Expect(candidate.RebootEscalated).To(BeFalse())
 
-func TestRebootHistoryKeepsReplacementAndRequiresCurrentEvidence(t *testing.T) {
-	history := NewRebootHistory()
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		Expect(history.Resolve(candidate, results)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.ReplaceNode))
+		Expect(candidate.RebootEscalated).To(BeTrue())
+		Expect(results[0].Action).To(Equal(cloudprovider.RebootNode))
+	})
 
-	replacement := []RepairResult{
-		repairResultForTest("StorageReady", "DiskFailure", cloudprovider.ReplaceNode, time.Unix(1, 0), nil),
-	}
-	if !history.Resolve(candidate, replacement) || candidate.Action != cloudprovider.ReplaceNode || candidate.RebootEscalated {
-		t.Fatalf("expected replacement evidence to remain unchanged: %#v", candidate)
-	}
-	if history.Resolve(candidate, nil) {
-		t.Fatal("expected history alone not to create repair work")
-	}
-}
+	It("does not record reboots while resolving", func() {
+		history := NewRebootHistory()
+		candidate := repairCandidateForTest("nodeclaim-uid")
+		results := []RepairResult{
+			repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
+		}
 
-func TestRebootHistoryUsesSlidingWindow(t *testing.T) {
-	clk := clocktesting.NewFakeClock(time.Unix(1, 0))
-	history := newRebootHistory(clk)
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	results := []RepairResult{
-		repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
-	}
+		for range 3 {
+			Expect(history.Resolve(candidate, results)).To(BeTrue())
+			Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
+		}
+	})
 
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	clk.Step(13 * time.Hour)
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
+	It("keys history by NodeClaim UID", func() {
+		history := NewRebootHistory()
+		results := []RepairResult{
+			repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
+		}
+		original := repairCandidateForTest("original-uid")
+		history.RecordCommittedReboot(original.NodeClaim.UID)
+		history.RecordCommittedReboot(original.NodeClaim.UID)
 
-	clk.Step(12 * time.Hour)
-	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.RebootNode {
-		t.Fatalf("expected the reboot at t=0h to leave the window at t=25h: %#v", candidate)
-	}
+		successor := repairCandidateForTest("successor-uid")
+		Expect(history.Resolve(successor, results)).To(BeTrue())
+		Expect(successor.Action).To(Equal(cloudprovider.RebootNode))
+	})
 
-	history.RecordCommittedReboot(candidate.NodeClaim.UID)
-	if !history.Resolve(candidate, results) || candidate.Action != cloudprovider.ReplaceNode {
-		t.Fatalf("expected reboots at t=13h and t=25h to trigger replacement: %#v", candidate)
-	}
-}
+	It("preserves replacement action and requires current evidence", func() {
+		history := NewRebootHistory()
+		candidate := repairCandidateForTest("nodeclaim-uid")
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
 
-func TestRebootHistoryBoundsConcurrentCommitsAtEscalationThreshold(t *testing.T) {
-	history := NewRebootHistory()
-	candidate := repairCandidateForTest("nodeclaim-uid")
-	const commits = 32
+		replacement := []RepairResult{
+			repairResultForTest("StorageReady", "DiskFailure", cloudprovider.ReplaceNode, time.Unix(1, 0), nil),
+		}
+		Expect(history.Resolve(candidate, replacement)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.ReplaceNode))
+		Expect(candidate.RebootEscalated).To(BeFalse())
+		Expect(history.Resolve(candidate, nil)).To(BeFalse())
+	})
 
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for range commits {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			history.RecordCommittedReboot(candidate.NodeClaim.UID)
-		}()
-	}
-	close(start)
-	wg.Wait()
+	It("uses a sliding window", func() {
+		clk := clocktesting.NewFakeClock(time.Unix(1, 0))
+		history := newRebootHistory(clk)
+		candidate := repairCandidateForTest("nodeclaim-uid")
+		results := []RepairResult{
+			repairResultForTest("AcceleratorReady", "XID48", cloudprovider.RebootNode, time.Unix(1, 0), nil),
+		}
 
-	if got := history.committedReboots(candidate.NodeClaim.UID); got != rebootsBeforeReplacement {
-		t.Fatalf("expected committed reboots to stop at %d, got %d", rebootsBeforeReplacement, got)
-	}
-}
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		clk.Step(13 * time.Hour)
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+
+		clk.Step(12 * time.Hour)
+		Expect(history.Resolve(candidate, results)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.RebootNode))
+
+		history.RecordCommittedReboot(candidate.NodeClaim.UID)
+		Expect(history.Resolve(candidate, results)).To(BeTrue())
+		Expect(candidate.Action).To(Equal(cloudprovider.ReplaceNode))
+	})
+
+	It("bounds concurrent commits at the escalation threshold", func() {
+		history := NewRebootHistory()
+		candidate := repairCandidateForTest("nodeclaim-uid")
+		const commits = 32
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range commits {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				history.RecordCommittedReboot(candidate.NodeClaim.UID)
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		Expect(history.recentReboots(candidate.NodeClaim.UID, history.clock.Now()).count).To(Equal(rebootsBeforeReplacement))
+	})
+})

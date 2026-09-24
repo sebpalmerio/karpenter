@@ -78,16 +78,12 @@ func (h *RebootHistory) RecordCommittedReboot(nodeClaimUID types.UID) {
 // Resolve applies recent reboot history to current eligible results, storing the resolved decision on the existing
 // disruption candidate.
 func (h *RebootHistory) Resolve(candidate *Candidate, results []RepairResult) bool {
-	resolvedResults, rebootEscalated := resolveRepairActions(h.committedReboots(candidate.NodeClaim.UID), results)
+	resolvedResults, rebootEscalated := resolveRepairActions(h.recentReboots(candidate.NodeClaim.UID, h.clock.Now()).count, results)
 	if !resolveRepairCandidate(candidate, resolvedResults) {
 		return false
 	}
 	candidate.RebootEscalated = rebootEscalated
 	return true
-}
-
-func (h *RebootHistory) committedReboots(nodeClaimUID types.UID) int {
-	return h.recentReboots(nodeClaimUID, h.clock.Now()).count
 }
 
 func (h *RebootHistory) recentReboots(nodeClaimUID types.UID, now time.Time) rebootHistoryEntry {

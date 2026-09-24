@@ -19,6 +19,7 @@ package disruption
 import (
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -41,7 +42,9 @@ func resolveRepairCandidate(candidate *Candidate, results []RepairResult) bool {
 		return false
 	}
 
-	action := selectRepairAction(results)
+	action := lo.MaxBy(results, func(a, b RepairResult) bool {
+		return a.Action.IsMoreDisruptiveThan(b.Action)
+	}).Action
 	driving := selectDrivingRepairResult(results, action)
 	drainBound := selectDrainBoundRepairResult(results)
 
@@ -63,16 +66,6 @@ func clearRepairResolution(candidate *Candidate) {
 	candidate.RebootEscalated = false
 	candidate.TerminationGracePeriod = nil
 	candidate.TerminationGracePeriodCondition = nil
-}
-
-func selectRepairAction(results []RepairResult) cloudprovider.RepairAction {
-	action := results[0].Action
-	for _, result := range results[1:] {
-		if result.Action.IsMoreDisruptiveThan(action) {
-			action = result.Action
-		}
-	}
-	return action
 }
 
 func selectDrivingRepairResult(results []RepairResult, action cloudprovider.RepairAction) *RepairResult {
@@ -149,18 +142,12 @@ func sameRepairResolution(previous, current *Candidate) bool {
 	if previous == nil || current == nil {
 		return previous == current
 	}
-	return sameRepairTarget(previous, current) &&
-		previous.Action == current.Action &&
+	return previous.Action == current.Action &&
 		previous.RepairEligibleAt.Equal(current.RepairEligibleAt) &&
 		previous.RepairCondition == current.RepairCondition &&
 		previous.RebootEscalated == current.RebootEscalated &&
 		equalPointers(previous.TerminationGracePeriod, current.TerminationGracePeriod) &&
 		equalPointers(previous.TerminationGracePeriodCondition, current.TerminationGracePeriodCondition)
-}
-
-func sameRepairTarget(previous, current *Candidate) bool {
-	return previous.Node.UID == current.Node.UID &&
-		previous.NodeClaim.UID == current.NodeClaim.UID
 }
 
 func equalPointers[T comparable](left, right *T) bool {

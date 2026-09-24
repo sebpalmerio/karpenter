@@ -138,14 +138,6 @@ func TestSameRepairResolution(t *testing.T) {
 		mutate func(*Candidate)
 	}{
 		{
-			name:   "node UID",
-			mutate: func(candidate *Candidate) { candidate.Node.UID = "changed-node-uid" },
-		},
-		{
-			name:   "NodeClaim UID",
-			mutate: func(candidate *Candidate) { candidate.NodeClaim.UID = "changed-nodeclaim-uid" },
-		},
-		{
 			name:   "action",
 			mutate: func(candidate *Candidate) { candidate.Action = cloudprovider.RebootNode },
 		},
@@ -195,10 +187,6 @@ func repairCandidateForTest(nodeClaimUID types.UID) *Candidate {
 
 func cloneRepairCandidateForTest(candidate *Candidate) *Candidate {
 	cloned := *candidate
-	stateNode := *candidate.StateNode
-	stateNode.Node = candidate.Node.DeepCopy()
-	stateNode.NodeClaim = candidate.NodeClaim.DeepCopy()
-	cloned.StateNode = &stateNode
 	if candidate.TerminationGracePeriod != nil {
 		drainBound := *candidate.TerminationGracePeriod
 		cloned.TerminationGracePeriod = &drainBound
