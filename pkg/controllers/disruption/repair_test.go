@@ -71,14 +71,30 @@ type terminationTimestampPatchErrorClient struct {
 	failNext bool
 }
 
+type nodeClaimDeleteErrorClient struct {
+	client.Client
+	err         error
+	failDeletes bool
+}
+
 func (c *terminationTimestampPatchErrorClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 	if nodeClaim, ok := obj.(*v1.NodeClaim); ok &&
 		c.failNext &&
 		nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey] != "" {
 		c.failNext = false
+		if err := c.Client.Patch(ctx, obj, patch, opts...); err != nil {
+			return err
+		}
 		return c.err
 	}
 	return c.Client.Patch(ctx, obj, patch, opts...)
+}
+
+func (c *nodeClaimDeleteErrorClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*v1.NodeClaim); ok && c.failDeletes {
+		return c.err
+	}
+	return c.Client.Delete(ctx, obj, opts...)
 }
 
 // These tests exercise end-user behavior of voluntary node repair (Node Repair Resiliency design). Each It maps to an
@@ -539,7 +555,7 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Candidates[0].Node.Name).To(Equal(mediumNode.Name))
 	})
 
-	It("should resolve the governing condition using only policies matching its reason", func() {
+	It("should resolve the drain bound using only policies matching each condition's reason", func() {
 		diagnosticGracePeriod := 10 * time.Minute
 		mediumGracePeriod := 5 * time.Minute
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
@@ -624,11 +640,11 @@ var _ = Describe("Repair", func() {
 			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Format(time.RFC3339)))
 	})
 
-	It("should retry a failed termination-deadline patch without losing the deadline", func() {
+	It("should preserve the termination deadline when the patch response is lost", func() {
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
-			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Duration(0)), Action: cloudprovider.ReplaceNode},
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(10 * time.Minute), Action: cloudprovider.ReplaceNode},
 		}
-		injectedErr := errors.New("injected termination timestamp patch failure")
+		injectedErr := errors.New("injected lost termination timestamp patch response")
 		failingClient := &terminationTimestampPatchErrorClient{Client: env.Client, err: injectedErr, failNext: true}
 		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov)
 		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, failingClient, prov, cloudProvider, recorder, failingQueue))
@@ -649,13 +665,49 @@ var _ = Describe("Repair", func() {
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(failingClient.failNext).To(BeFalse())
 		Expect(cmds[0].Candidates[0].NodeClaim.Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+		deadline := env.Clock.Now().Add(10 * time.Minute).Format(time.RFC3339)
 		current := ExpectExists(ctx, env.Client, nodeClaim)
-		Expect(current.Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+		Expect(current.Annotations).To(HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
 		Expect(current.DeletionTimestamp.IsZero()).To(BeTrue())
 
+		env.Clock.Step(5 * time.Minute)
 		ExpectObjectReconciled(ctx, failingClient, failingQueue, cmds[0].Candidates[0].NodeClaim)
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
-			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Format(time.RFC3339)))
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
+	})
+
+	It("should preserve the termination deadline when deletion is retried", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(10 * time.Minute), Action: cloudprovider.ReplaceNode},
+		}
+		injectedErr := errors.New("injected NodeClaim deletion failure")
+		failingClient := &nodeClaimDeleteErrorClient{Client: env.Client, err: injectedErr, failDeletes: true}
+		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov)
+		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, failingClient, prov, cloudProvider, recorder, failingQueue))
+		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, failingQueue, clusterCost,
+			disruption.WithMethods(failingRepair))
+
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer")
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, failingController)
+		cmds := failingQueue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+
+		result := ExpectObjectReconciled(ctx, failingClient, failingQueue, cmds[0].Candidates[0].NodeClaim)
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		deadline := env.Clock.Now().Add(10 * time.Minute).Format(time.RFC3339)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
+
+		env.Clock.Step(5 * time.Minute)
+		failingClient.failDeletes = false
+		ExpectObjectReconciled(ctx, failingClient, failingQueue, cmds[0].Candidates[0].NodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, deadline))
 	})
 
 	// INV-S10: when both the policy and the NodeClaim bound the drain, the smaller (most forceful) wins.
@@ -788,6 +840,61 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Replacements[0].IsStaticNodeClaim).To(BeTrue())
 	})
 
+	It("should reject a static replacement when the resolved condition changes before reservation", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{
+				ConditionType:          "BadNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				TolerationDuration:     30 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+			{
+				ConditionType:          "WorseNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				ReasonRegex:            ".*",
+				TolerationDuration:     5 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(2 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+		}
+		nodePool = test.StaticNodePool(v1.NodePool{
+			Spec: v1.NodePoolSpec{
+				Replicas: lo.ToPtr[int64](5),
+				Limits:   v1.Limits{resources.Node: resource.MustParse("6")},
+				Disruption: v1.Disruption{
+					Budgets: []v1.Budget{{Nodes: "100%"}},
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool)
+		newRepairController()
+		nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		for i := range nodes {
+			initNode(nodeClaims[i], nodes[i])
+		}
+		markUnhealthy(nodes[0], "BadNode")
+		markUnhealthy(nodes[0], "WorseNode")
+		env.Clock.Step(31 * time.Minute)
+
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidates).To(HaveLen(1))
+
+		current := ExpectExists(ctx, env.Client, nodes[0])
+		current.Status.Conditions = lo.Reject(current.Status.Conditions, func(condition corev1.NodeCondition, _ int) bool {
+			return condition.Type == "WorseNode"
+		})
+		ExpectApplied(ctx, env.Client, current)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(current))
+
+		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(commands).To(BeEmpty())
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)).To(Equal(int64(1)))
+		cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+	})
+
 	It("should honor a static NodePool node limit before reserving replacement capacity", func() {
 		nodePool = test.StaticNodePool(v1.NodePool{
 			Spec: v1.NodePoolSpec{
@@ -905,6 +1012,47 @@ var _ = Describe("Repair", func() {
 
 		// This pod was not part of the original scheduling result and must force a fresh pass.
 		bindReschedulablePod(node)
+
+		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(commands).To(BeEmpty())
+	})
+
+	It("should reject dynamic scheduling results when the resolved condition changes after candidate selection", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{
+				ConditionType:          "BadNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				TolerationDuration:     30 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(10 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+			{
+				ConditionType:          "WorseNode",
+				ConditionStatus:        corev1.ConditionFalse,
+				ReasonRegex:            ".*",
+				TolerationDuration:     5 * time.Minute,
+				TerminationGracePeriod: lo.ToPtr(2 * time.Minute),
+				Action:                 cloudprovider.ReplaceNode,
+			},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		markUnhealthy(node, "WorseNode")
+		env.Clock.Step(31 * time.Minute)
+
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(candidates).To(HaveLen(1))
+
+		current := ExpectExists(ctx, env.Client, node)
+		current.Status.Conditions = lo.Reject(current.Status.Conditions, func(condition corev1.NodeCondition, _ int) bool {
+			return condition.Type == "WorseNode"
+		})
+		ExpectApplied(ctx, env.Client, current)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(current))
 
 		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
 		Expect(err).NotTo(HaveOccurred())

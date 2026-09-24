@@ -282,7 +282,7 @@ func (r *RepairPolicyEvaluation) considerPolicy(policy compiledPolicy, transitio
 	if now.Before(eligibleAt) {
 		if len(r.eligiblePolicies) == 0 && (r.EligibleAt.IsZero() ||
 			eligibleAt.Before(r.EligibleAt) ||
-			(eligibleAt.Equal(r.EligibleAt) && repairActionRank(policy.Action) > repairActionRank(r.Action))) {
+			(eligibleAt.Equal(r.EligibleAt) && policy.Action.IsMoreDisruptiveThan(r.Action))) {
 			r.Action = policy.Action
 			r.EligibleAt = eligibleAt
 		}
@@ -294,7 +294,7 @@ func (r *RepairPolicyEvaluation) considerPolicy(policy compiledPolicy, transitio
 		EligibleAt: eligibleAt,
 	})
 	r.considerTerminationGracePeriod(policy.TerminationGracePeriod)
-	if len(r.eligiblePolicies) == 1 || repairActionRank(policy.Action) > repairActionRank(r.Action) {
+	if len(r.eligiblePolicies) == 1 || policy.Action.IsMoreDisruptiveThan(r.Action) {
 		r.Action = policy.Action
 		r.EligibleAt = eligibleAt
 		return
@@ -328,15 +328,4 @@ func denseRanks(policies []cloudprovider.RepairPolicy) map[int]int {
 		ranks[priority] = rank
 	}
 	return ranks
-}
-
-func repairActionRank(action cloudprovider.RepairAction) int {
-	switch action {
-	case cloudprovider.ReplaceNode:
-		return 1
-	case cloudprovider.RebootNode:
-		return 0
-	default:
-		return -1
-	}
 }
