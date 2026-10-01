@@ -49,9 +49,17 @@ import (
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 
+// SimulationOptions configures disruption-specific scheduling behavior.
+type SimulationOptions struct {
+	// IncludeBlockedCandidatePods includes candidate pods even when they cannot currently be evicted.
+	IncludeBlockedCandidatePods bool
+}
+
+// SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
+//
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
-	schedulerOpts []scheduling.Options, candidates ...*Candidate,
+	schedulerOpts []scheduling.Options, simulationOpts SimulationOptions, candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
@@ -75,22 +83,28 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
 
-	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
-	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
-	// these pods are evicted is wasteful.
-	pdbs, err := pdb.NewLimits(ctx, kubeClient)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
-	}
 	// candidatePods are the pods on consolidation candidate nodes that we will reschedule. Their UIDs feed
 	// deletingPodUIDs below so the DRA allocator frees the devices they hold and re-allocates their claims onto the
 	// replacement capacity, mirroring how pods on already-deleting nodes are treated.
 	var candidatePods []*corev1.Pod
-	for _, n := range candidates {
-		currentlyReschedulablePods := lo.Filter(n.reschedulablePods, func(p *corev1.Pod, _ int) bool {
-			return pdbs.IsCurrentlyReschedulable(p, clk, recorder)
+	if simulationOpts.IncludeBlockedCandidatePods {
+		candidatePods = lo.FlatMap(candidates, func(candidate *Candidate, _ int) []*corev1.Pod {
+			return candidate.reschedulablePods
 		})
-		candidatePods = append(candidatePods, currentlyReschedulablePods...)
+	} else {
+		// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
+		// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
+		// these pods are evicted is wasteful. Repair opts out because its bounded drain owns when those pods leave,
+		// while replacement planning must still account for their demand.
+		pdbs, err := pdb.NewLimits(ctx, kubeClient)
+		if err != nil {
+			return scheduling.Results{}, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+		}
+		candidatePods = lo.FlatMap(candidates, func(candidate *Candidate, _ int) []*corev1.Pod {
+			return lo.Filter(candidate.reschedulablePods, func(p *corev1.Pod, _ int) bool {
+				return pdbs.IsCurrentlyReschedulable(p, clk, recorder)
+			})
+		})
 	}
 	pods = append(pods, candidatePods...)
 
@@ -184,9 +198,10 @@ func SimulateSchedulingWithReservedFallback(
 	recorder events.Recorder,
 	candidate *Candidate,
 	terminateFirstEnabled bool,
+	simulationOpts SimulationOptions,
 ) (results scheduling.Results, terminateFirst bool, err error) {
 	// Pass 1: replace-first feasibility.
-	results, err = SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, nil, candidate)
+	results, err = SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, nil, simulationOpts, candidate)
 	if err != nil || results.AllNonPendingPodsScheduled() {
 		return results, false, err
 	}
@@ -202,7 +217,7 @@ func SimulateSchedulingWithReservedFallback(
 	// Pass 2: terminate-first feasibility — credit the candidate's reservation slot back and require every pod to place
 	// under strict mode.
 	tfResults, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
-		[]scheduling.Options{scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity(reservationID, 1)}, candidate)
+		[]scheduling.Options{scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity(reservationID, 1)}, simulationOpts, candidate)
 	if err != nil {
 		return results, false, err
 	}
@@ -317,15 +332,36 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 	return nodePoolMap, nodePoolToInstanceTypesMap, nil
 }
 
-// BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
-// We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
-//
-//nolint:gocyclo
-func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
-	disruptionBudgetMapping := map[string]int{}
-	numNodes := map[string]int{}   // map[nodepool] -> node count in nodepool
-	disrupting := map[string]int{} // map[nodepool] -> nodes undergoing disruption
-	for _, node := range cluster.DeepCopyNodes() {
+// The disrupting count is reason-dependent, so pass the same reason on to
+// MustGetAllowedDisruptions or NodePoolBudgetMap.
+func NodePoolStats(cluster *state.Cluster, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
+	return NodePoolStatsFromNodes(cluster.DeepCopyNodes(), reason)
+}
+
+func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, nodePools map[string]*v1.NodePool, numNodes, disrupting map[string]int, reason v1.DisruptionReason) map[string]int {
+	out := map[string]int{}
+	for name, np := range nodePools {
+		allowed := np.MustGetAllowedDisruptions(clk, numNodes[name], reason)
+		remaining := allowed - disrupting[name]
+		if remaining < 0 {
+			log.FromContext(ctx).V(1).WithValues(
+				"nodePool", name,
+				"reason", string(reason),
+				"allowed", allowed,
+				"disrupting", disrupting[name],
+			).Info("disruption budget already exhausted; clamping to 0")
+			remaining = 0
+		}
+		out[name] = remaining
+	}
+	return out
+}
+
+// NodePoolStats against a snapshot the caller already holds.
+func NodePoolStatsFromNodes(nodes []*state.StateNode, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
+	numNodes = map[string]int{}
+	disrupting = map[string]int{}
+	for _, node := range nodes {
 		// We only consider nodes that we own and are initialized towards the total.
 		// If a node is launched/registered, but not initialized, pods aren't scheduled
 		// to the node, and these are treated as unhealthy until they're cleaned up.
@@ -360,6 +396,14 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 			disrupting[nodePool]++
 		}
 	}
+	return numNodes, disrupting
+}
+
+// BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
+// We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
+func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
+	disruptionBudgetMapping := map[string]int{}
+	numNodes, disrupting := NodePoolStats(cluster, reason)
 	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
 	if err != nil {
 		return disruptionBudgetMapping, fmt.Errorf("listing node pools, %w", err)
