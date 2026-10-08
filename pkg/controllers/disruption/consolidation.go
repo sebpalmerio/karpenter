@@ -148,7 +148,7 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 // succeeds.
 func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidate) []*Candidate {
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].SavingsRatio() > candidates[j].SavingsRatio()
+		return candidates[i].DisruptionCost < candidates[j].DisruptionCost
 	})
 	return candidates
 }
