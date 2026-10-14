@@ -29,7 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/test/pkg/environment/common"
 )
 
 // These tests exercise node repair (voluntary disruption of unhealthy nodes) and the budgeted-breaker safeguard. They
@@ -120,6 +122,16 @@ var _ = Describe("Repair", Ordered, ContinueOnFailure, func() {
 		env.ConsistentlyExpectNoDisruptions(5, time.Minute)
 		env.ExpectExists(nodes[0])
 		env.ExpectExists(nodes[1])
+
+		// The breaker tells the operator why repair is withheld, on the pool and on each unhealthy node.
+		Eventually(func(g Gomega) {
+			eventList := &corev1.EventList{}
+			g.Expect(env.Client.List(env, eventList)).To(Succeed())
+			blocked := lo.FilterMap(eventList.Items, func(e corev1.Event, _ int) (string, bool) {
+				return e.InvolvedObject.Kind + "/" + e.InvolvedObject.Name, e.Reason == events.NodeRepairBlocked
+			})
+			g.Expect(blocked).To(ContainElements("NodePool/"+nodePool.Name, "Node/"+nodes[0].Name, "Node/"+nodes[1].Name))
+		}).Should(Succeed())
 	})
 
 	It("resumes repair once the pool drops back under the breaker threshold", func() {
@@ -152,14 +164,15 @@ var _ = Describe("Repair", Ordered, ContinueOnFailure, func() {
 	It("force-terminates a drain-blocked unhealthy node", func() {
 		// Node repair is non-discretionary: it ignores do-not-disrupt and PDBs (only the do-not-repair annotation vetoes
 		// it). Every pod carries do-not-disrupt, so graceful eviction cannot complete — the node can only leave by a
-		// FORCE-termination once repair's drain bound elapses. The pod grace stays below the drain bound, since the
-		// terminator deletes a pod whose grace outlasts the remaining bound as soon as the drain starts. The drain bound
-		// is min(RepairPolicy TGP, NodePool TGP), so the NodePool TGP bounds it even for a provider whose policy sets
-		// none. Fault only 1 of 5 (under the breaker threshold) so repair runs; a single-node pool would read 100%
-		// unhealthy and trip the breaker.
+		// FORCE-termination once repair's drain bound elapses. The NodePool sets no TerminationGracePeriod, so the bound
+		// comes from the RepairPolicy alone (45s for KWOK's simulated fault): repair must bound the drain even on a pool
+		// that would otherwise wait on eviction indefinitely. The pod grace stays below the drain bound, since the
+		// terminator deletes a pod whose grace outlasts the remaining bound as soon as the drain starts. Fault only 1 of
+		// 5 (under the breaker threshold) so repair runs; a single-node pool would read 100% unhealthy and trip the
+		// breaker.
 		// (This asserts the force behavior, not an exact TGP duration: on KWOK node removal is near-instant once the
 		// force-delete is issued, so the elapsed time isn't a reliable signal.)
-		nodePool.Spec.Template.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Minute}
+		nodePool.Spec.Template.Spec.TerminationGracePeriod = nil
 		appLabels := map[string]string{"app": "repair-drain"}
 		dep := test.Deployment(test.DeploymentOptions{
 			Replicas: 5,
@@ -179,10 +192,10 @@ var _ = Describe("Repair", Ordered, ContinueOnFailure, func() {
 
 		env.ExpectRepairFaultInjected(nodes[0])
 		env.EventuallyExpectTaintedNodeCount("==", 1) // repair decided to terminate it despite the blocking pod
-		// The blocking pod holds the drain until the bound (1m) minus its grace (10s)
+		// The blocking pod holds the drain until the bound minus its grace (10s)
 		Consistently(func(g Gomega) {
 			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodes[0]), &corev1.Node{})).To(Succeed())
-		}, 30*time.Second).Should(Succeed())
+		}, 20*time.Second).Should(Succeed())
 		env.EventuallyExpectNotFound(nodes[0]) // force-terminated despite the un-evictable do-not-disrupt pod
 		env.EventuallyExpectNodeCount("==", 5)
 		env.EventuallyExpectHealthyPodCount(selector, 5)
@@ -212,23 +225,85 @@ var _ = Describe("Repair", Ordered, ContinueOnFailure, func() {
 		env.ExpectExists(nodes[0])
 	})
 
-	It("respects disruption budgets", func() {
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+	It("respects Unhealthy disruption budgets", func() {
+		// Two unhealthy nodes need a 10-node pool to stay at the breaker threshold (2 <= ceil(20% of 10)).
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}}}
 		appLabels := map[string]string{"app": "repair-budget"}
-		dep := test.Deployment(test.DeploymentOptions{Replicas: 1, PodOptions: test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: appLabels}}})
+		dep := test.Deployment(test.DeploymentOptions{
+			Replicas: 10,
+			PodOptions: test.PodOptions{
+				ObjectMeta:          metav1.ObjectMeta{Labels: appLabels},
+				PodAntiRequirements: hostnameAntiAffinity(appLabels),
+			},
+		})
 		selector := labels.SelectorFromSet(appLabels)
 		env.ExpectCreated(nodeClass, nodePool, dep)
-		env.EventuallyExpectHealthyPodCount(selector, 1)
-		node := env.EventuallyExpectNodeCount("==", 1)[0]
+		env.EventuallyExpectHealthyPodCount(selector, 10)
+		nodes := env.EventuallyExpectNodeCount("==", 10)
 
-		env.ExpectRepairFaultInjected(node)
-		env.ConsistentlyExpectNoDisruptions(1, time.Minute)
+		// Hold both unhealthy nodes so the first repair stays in flight, consuming the budget, until released
+		for _, node := range nodes[:2] {
+			Expect(env.Client.Get(env, client.ObjectKeyFromObject(node), node)).To(Succeed())
+			node.Finalizers = append(node.Finalizers, common.TestingFinalizer)
+			env.ExpectUpdated(node)
+			env.ExpectRepairFaultInjected(node)
+		}
+		env.ConsistentlyExpectNoDisruptions(10, time.Minute)
 
-		// Lifting the budget releases the repair, so it was the budget holding it back
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+		// A budget of 1 releases repair one node at a time: the second unhealthy node waits on the first
+		nodePool.Spec.Disruption.Budgets[0].Nodes = "1"
 		env.ExpectUpdated(nodePool)
-		env.EventuallyExpectNotFound(node)
-		env.EventuallyExpectHealthyPodCount(selector, 1)
+		env.EventuallyExpectTaintedNodeCount("==", 1)
+		Consistently(func(g Gomega) {
+			nodeList := &corev1.NodeList{}
+			g.Expect(env.Client.List(env, nodeList, client.MatchingFields{"spec.taints[*].karpenter.sh/disrupted": "true"})).To(Succeed())
+			g.Expect(nodeList.Items).To(HaveLen(1))
+		}, time.Minute).Should(Succeed())
+
+		for _, node := range nodes[:2] {
+			Expect(env.ExpectTestingFinalizerRemoved(node)).To(Succeed())
+		}
+		env.EventuallyExpectNotFound(nodes[0], nodes[1])
+		env.EventuallyExpectNodeCount("==", 10)
+		env.EventuallyExpectHealthyPodCount(selector, 10)
+	})
+
+	It("does not remove an unhealthy node whose replacement never initializes", func() {
+		// The startup taint is never removed, so a replacement launched from the updated template never initializes.
+		// Changing the template also drifts the existing nodes, so a Drifted budget of 0 keeps drift out of the way.
+		appLabels := map[string]string{"app": "repair-replacement-uninitialized"}
+		dep := test.Deployment(test.DeploymentOptions{
+			Replicas: 5,
+			PodOptions: test.PodOptions{
+				ObjectMeta:          metav1.ObjectMeta{Labels: appLabels},
+				PodAntiRequirements: hostnameAntiAffinity(appLabels),
+			},
+		})
+		selector := labels.SelectorFromSet(appLabels)
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 5)
+		nodes := env.EventuallyExpectInitializedNodeCount("==", 5)
+		startingNodeClaims := env.EventuallyExpectCreatedNodeClaimCount("==", 5)
+
+		nodePool.Spec.Disruption.Budgets = append(nodePool.Spec.Disruption.Budgets, v1.Budget{Nodes: "0", Reasons: []v1.DisruptionReason{v1.DisruptionReasonDrifted}})
+		nodePool.Spec.Template.Spec.StartupTaints = []corev1.Taint{{Key: "example.com/taint", Effect: corev1.TaintEffectPreferNoSchedule}}
+		env.ExpectUpdated(nodePool)
+		env.EventuallyExpectDrifted(startingNodeClaims...) // the controller has seen the new template
+
+		env.ExpectRepairFaultInjected(nodes[0]) // 1 of 5 unhealthy (under the breaker threshold)
+		taintedNodes := env.EventuallyExpectTaintedNodeCount("==", 1)
+		env.EventuallyExpectNodeClaimCount("==", 6) // replacement launched
+
+		// Repair should fail once the replacement times out, and the unhealthy node should be untainted
+		env.EventuallyExpectNodesUntaintedWithTimeout(11*time.Minute, taintedNodes...)
+
+		// Assert over several minutes that a later repair pass doesn't schedule the pods to the uninitialized
+		// replacement and remove the unhealthy node without one
+		Consistently(func(g Gomega) {
+			original := &corev1.Node{}
+			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nodes[0]), original)).To(Succeed())
+			g.Expect(original.DeletionTimestamp.IsZero()).To(BeTrue())
+		}, "2m").Should(Succeed())
 	})
 
 	It("ignores the do-not-disrupt annotation on the node", func() {
