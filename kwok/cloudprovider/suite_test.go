@@ -113,6 +113,19 @@ var _ = Describe("Delete", func() {
 
 		Expect(cp.Delete(ctx, nodeClaim)).To(Satisfy(cloudprovider.IsNodeClaimNotFoundError))
 	})
+	DescribeTable("should not delete another Node for a providerID KWOK does not own",
+		func(providerID string) {
+			cp, kubeClient := newCloudProvider(0, interceptor.Funcs{})
+			Expect(kubeClient.Create(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "victim"}})).To(Succeed())
+			nodeClaim.Status.ProviderID = providerID
+
+			Expect(cp.Delete(ctx, nodeClaim)).To(Satisfy(cloudprovider.IsNodeClaimNotFoundError))
+			Expect(nodes(kubeClient)(Default)).To(HaveLen(1))
+		},
+		Entry("bare name", "victim"),
+		Entry("prefix in the middle", "vickwok://tim"),
+		Entry("prefix at the end", "victimkwok://"),
+	)
 	It("should return NodeClaimNotFound from Get for a providerID KWOK does not own", func() {
 		cp, _ := newCloudProvider(0, interceptor.Funcs{
 			// The fake client skips the name check client-go does before sending a request
